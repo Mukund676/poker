@@ -1,83 +1,24 @@
 import Fastify from 'fastify';
-import websocket from 'fastify-websocket';
+import websocket from '@fastify/websocket';
 import { PrismaClient } from '@prisma/client';
 import { newDeck, shuffle, deal } from '@poker/engine';
 import type * as Types from './types';
 import { Hand } from 'pokersolver';
+
 const prisma = new PrismaClient();
-const app = Fastify({ logger: false });
+const app = Fastify({ logger: true });
 app.register(websocket);
-//
-// In-memory game state
-//
-interface InMemoryState {
-  holeCards: Record<string, number[]>;
-  community: number[];
-  deck: number[];
-  players: string[];
-  currentIndex: number;
-  stacks: Record<string, number>;
-  pot: number;
-  actionLog: Record<string, Types.Action[]>;
-  currentBet: number;
-  bets: Record<string, number>; // playerId to amount bet this round
-  toCall: Record<string, number>; // playerId to amount to call
+
+const tableSockets = new Map<string, Set<any>>();
+const SUITS = ['h', 's', 'c', 'd'];
+const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+
+function cardIdToString(cardId: number): string {
+  if (cardId < 0 || cardId > 51) return '';
+  const suit = SUITS[Math.floor(cardId / 13)];
+  const rank = RANKS[cardId % 13];
+  return rank + suit;
 }
-
-function calculatePots(state: InMemoryState): { pot: number, players: string[], winners: string[] }[] {
-  const playersInHand = Object.keys(state.holeCards);
-  const pots = [];
-  
-  // Create a sorted list of bets from players who are still in the hand
-  const sortedBets = [...new Set(playersInHand.map(p => state.bets[p]))].sort((a, b) => a - b);
-
-  let lastBet = 0;
-  for (const bet of sortedBets) {
-    const pot = {
-      amount: 0,
-      players: playersInHand.filter(p => state.bets[p] >= bet)
-    };
-    for (const player of playersInHand) {
-      const contribution = Math.min(state.bets[player], bet) - lastBet;
-      if (contribution > 0) {
-        pot.amount += contribution;
-      }
-    }
-    pots.push(pot);
-    lastBet = bet;
-  }
-  
-  // Now determine the winner(s) for each pot
-  const potResults = pots.map(pot => {
-    const eligibleHands = pot.players.map(pid => {
-      const hand = evaluateHand(state.holeCards[pid], state.community);
-      return { ...hand, playerId: pid };
-    });
-    const winners = Hand.winners(eligibleHands).map(w => w.playerId);
-    return { pot: pot.amount, players: pot.players, winners };
-  });
-
-  return potResults;
-}
-
-// Map of tableId → set of WebSocket connections
-const tableSockets = new Map<string, Set<{
-  socket: WebSocket;
-}>>();
-
-
-app.get('/ws/:tableId', { websocket: true }, (connection, req) => {
-  const { tableId } = (req.params as any);
-  if (!tableSockets.has(tableId)) {
-    tableSockets.set(tableId, new Set());
-  }
-  tableSockets.get(tableId)!.add(connection);
-
-  connection.socket.on('close', () => {
-    tableSockets.get(tableId)!.delete(connection);
-  });
-});
-
 
 function broadcast(tableId: string, msg: any) {
   const conns = tableSockets.get(tableId);
@@ -88,343 +29,261 @@ function broadcast(tableId: string, msg: any) {
   }
 }
 
-app.get(
-  '/ws/:tableId',
-  { websocket: true },
-  (connection, req) => {
-    const { tableId } = req.params as { tableId: string };
-    if (!tableSockets.has(tableId)) {
-      tableSockets.set(tableId, new Set());
-    }
-    tableSockets.get(tableId)!.add(connection);
-
-    // Clean up on close
-    connection.socket.once('close', () => {
-      tableSockets.get(tableId)!.delete(connection);
-    });
+function calculatePots(state: Types.InMemoryState): { pot: number, players: string[], winners: string[] }[] {
+  const playersInHand = Object.keys(state.holeCards).filter(p => state.players.includes(p));
+  const pots: { amount: number; players: string[] }[] = [];
+  const sortedBets = [...new Set(playersInHand.map(p => state.bets[p] || 0))].sort((a, b) => a - b);
+  let lastBetLevel = 0;
+  for (const betLevel of sortedBets) {
+      if (betLevel <= lastBetLevel) continue;
+      const pot = {
+          amount: 0,
+          players: playersInHand.filter(p => (state.bets[p] || 0) >= betLevel)
+      };
+      for (const player of playersInHand) {
+          const contribution = Math.min(state.bets[player] || 0, betLevel) - lastBetLevel;
+          if (contribution > 0) {
+              pot.amount += contribution;
+          }
+      }
+      if (pot.amount > 0) {
+          pots.push(pot);
+      }
+      lastBetLevel = betLevel;
   }
-);
+  const mainPotAmount = state.pot;
+  if(pots.length > 0) {
+    pots[0].amount += mainPotAmount;
+  } else {
+    pots.push({ amount: mainPotAmount, players: [...state.players] });
+  }
 
+  const potResults = pots.map(pot => {
+    const communityCardsStr = state.community.map(cardIdToString);
+    const eligibleHands = pot.players.map(pid => {
+      const holeCardsStr = state.holeCards[pid].map(cardIdToString);
+      const allCards = holeCardsStr.concat(communityCardsStr);
+      const solvedHand = Hand.solve(allCards);
+      return { pid: pid, solvedHand: solvedHand };
+    });
+    if (eligibleHands.length === 0) {
+      return { pot: pot.amount, players: pot.players, winners: [] };
+    }
+    const winningPokerHands = Hand.winners(eligibleHands.map(h => h.solvedHand));
+    const winningDescr = winningPokerHands[0].descr;
+    const winners = eligibleHands.filter(h => h.solvedHand.descr === winningDescr).map(h => h.pid);
+    return { pot: pot.amount, players: pot.players, winners: [...new Set(winners)] };
+  });
+  return potResults;
+}
 
-//
-// Health-check
-//
-app.get('/health', async () => ({ ok: true }));
-
-//
-// Test endpoints
-//
-app.get('/test-db', async () => {
-  const p = await prisma.player.create({ data: { name: 'Alice' } });
-  return p;
+app.get('/ws/:tableId', { websocket: true }, (connection, req) => {
+  const { tableId } = (req.params as any);
+  if (!tableSockets.has(tableId)) {
+    tableSockets.set(tableId, new Set());
+  }
+  tableSockets.get(tableId)!.add(connection);
+  connection.socket.on('close', () => {
+    tableSockets.get(tableId)!.delete(connection);
+  });
 });
 
-app.get('/test-deck', () => {
-  const deck = shuffle(newDeck(), 'test-seed');
-  const { hole, flop, turn, river, remainder } = deal(deck);
-  return { hole, flop, turn, river, remaining: remainder.length };
-});
-
-//
-// Start a new game
-//
-app.post<{ Body: Types.StartGameRequest; Reply: Types.StartGameResponse }>(
+app.post<{ Body: Types.StartGameRequest; Reply: Types.StartGameResponse | { error: string, message: string } }>(
   '/start-game',
   async (req, reply) => {
-    const { tableName, playerIds } = req.body;
-
-    // 1) Create Table in DB
-    const table = await prisma.table.create({
-      data: { name: tableName, seats: playerIds.length },
-    });
-
-    // 2) Shuffle & deal hole cards
-    let deck = shuffle(newDeck(), Date.now().toString());
-    const holeMap: Record<string, number[]> = {};
-
-    // Upsert players, persist initial hand history
-    for (const pid of playerIds) {
-      await prisma.player.upsert({
-        where: { id: pid },
-        update: {},
-        create: { id: pid, name: `Player ${pid}`, chips: 1000 },
-      });
-
-      const cards = [deck.shift()!, deck.shift()!];
-      holeMap[pid] = cards;
-
-      await prisma.handHistory.create({
-        data: {
-          tableId: table.id,
-          playerId: pid,
-          holeCards: cards.join(','),
-          community: '',
-          actionLog: '[]',
-          result: 'none',
-        },
-      });
+    try {
+      const { tableName, playerIds } = req.body;
+      const table = await prisma.table.create({ data: { name: tableName, seats: playerIds.length } });
+      let deck = shuffle(newDeck(), Date.now().toString());
+      const holeMap: Record<string, number[]> = {};
+      for (const pid of playerIds) {
+        await prisma.player.upsert({
+          where: { id: pid },
+          update: {},
+          create: { id: pid, name: `Player ${pid}`, chips: 1000 },
+        });
+        const cards = [deck.shift()!, deck.shift()!];
+        holeMap[pid] = cards;
+      }
+      const initialState: Types.InMemoryState = {
+        holeCards: holeMap, community: [], deck, players: playerIds, currentIndex: 0,
+        stacks: Object.fromEntries(playerIds.map(pid => [pid, 1000])),
+        pot: 0, currentBet: 0,
+        toCall: Object.fromEntries(playerIds.map(pid => [pid, 0])),
+        bets: Object.fromEntries(playerIds.map(pid => [pid, 0])),
+        actionLog: Object.fromEntries(playerIds.map(pid => [pid, []])),
+      };
+      await prisma.gameState.create({ data: { tableId: table.id, state: initialState as any } });
+      const resp: Types.StartGameResponse = {
+        tableId: table.id, holeCards: holeMap, community: [], deckRemaining: deck.length,
+      };
+      broadcast(table.id, { type: 'gameState', payload: resp });
+      return reply.send(resp);
+    } catch (error: any) {
+      console.error("!!! ERROR IN /start-game:", error);
+      return reply.status(500).send({ error: "Internal Server Error", message: error.message });
     }
-
-    // 3) Initialize in-memory state
-    const initialState = {
-      holeCards: holeMap,
-      community: [],
-      deck,
-      players: playerIds,
-      currentIndex: 0,
-      stacks: Object.fromEntries(playerIds.map(pid => [pid, 1000])),
-      pot: 0,
-      currentBet: 0,
-      toCall: Object.fromEntries(playerIds.map(pid => [pid, 0])),
-      bets: Object.fromEntries(playerIds.map(pid => [pid, 0])),
-      actionLog: Object.fromEntries(playerIds.map(pid => [pid, []])),
-    };
-
-await prisma.gameState.create({
-  data: {
-    tableId: table.id,
-    state: initialState,
-  },
-});
-
-
-    // 4) Respond
-    const resp = {
-      tableId: table.id,
-      holeCards: holeMap,
-      community: [],
-      deckRemaining: deck.length,
-    };
-    broadcast(table.id, { type: 'gameState', payload: resp });
-    return resp;
   }
 );
 
-//
-// Fetch current game state
-//
-app.get<{
-  Querystring: { tableId: string };
-  Reply: Types.GameStateResponse;
-}>('/game-state', async (req, reply) => {
-  const { tableId } = req.query;
-
-  // 1. Fetch the game state from the database
-  const gameStateRecord = await prisma.gameState.findUnique({
-    where: { tableId },
+app.get<{ Querystring: { tableId: string }; Reply: Types.GameStateResponse | { error: string } }>(
+  '/game-state', async (req, reply) => {
+    const { tableId } = req.query;
+    const gameStateRecord = await prisma.gameState.findUnique({ where: { tableId } });
+    if (!gameStateRecord) {
+      return reply.status(404).send({ error: 'Game not found' });
+    }
+    const state: Types.InMemoryState = gameStateRecord.state as any;
+    const response: Types.GameStateResponse = {
+        tableId,
+        holeCards: state.holeCards, community: state.community,
+        deckRemaining: state.deck.length, pot: state.pot, stacks: state.stacks,
+        toAct: state.players[state.currentIndex], actionLog: state.actionLog,
+    };
+    return reply.send(response);
   });
 
-  // 2. Handle the case where the game doesn't exist
-  if (!gameStateRecord) {
-    return reply.status(404).send({ error: 'Game not found' } as any);
-  }
-
-  // 3. Extract the state and cast it to your InMemoryState type
-  const state: InMemoryState = gameStateRecord.state as any;
-
-  // 4. Construct and return the response, just like before
-  return {
-    tableId,
-    holeCards: state.holeCards,
-    community: state.community,
-    deckRemaining: state.deck.length,
-    pot: state.pot,
-    stacks: state.stacks,
-    toAct: state.players[state.currentIndex],
-    actionLog: state.actionLog,
-  };
-});
-
-//
-// Handle a bet / action
-//
 app.post<{ Body: Types.BetRequest; Reply: Types.BetResponse }>(
-  '/bet',
-  async (req, reply) => {
+  '/bet', async (req, reply) => {
     const { tableId, playerId, action, amount } = req.body;
     const gameStateRecord = await prisma.gameState.findUnique({ where: { tableId } });
     if (!gameStateRecord) {
       return reply.status(404).send({ success: false, error: 'Game not found' });
     }
-    const state: InMemoryState = gameStateRecord.state;
-    if (!state) {
-      return reply.status(404).send({ success: false, error: 'Table not found' });
+    const state: Types.InMemoryState = gameStateRecord.state as any;
+    if (state.players.length > 0 && playerId !== state.players[state.currentIndex]) {
+      return reply.status(400).send({ success: false, error: 'Not your turn' });
     }
 
-    // Validate turn
-    const expected = state.players[state.currentIndex];
-    if (playerId !== expected) {
-      return reply
-        .status(400)
-        .send({ success: false, error: 'Not your turn' });
-    }
-
-    // Process action
     switch (action) {
       case 'fold':
-        state.actionLog[playerId].push('fold');
+        state.actionLog[playerId].push({ action: 'fold' });
         state.players = state.players.filter(p => p !== playerId);
         if (state.players.length === 1) {
-          const winner = state.players[0];
-          state.stacks[winner] += state.pot; // winner takes pot
-
-          await prisma.handHistory.updateMany({
-            where: { tableId, playerId: winner },
-            data: { result: 'win'},
-          });
-          await prisma.handHistory.updateMany({
-            where: { tableId, NOT: { playerId: winner } },
-            data: { result: 'lose' },
-          });
-          await prisma.gameState.delete({ where: { tableId }});  // end game
-          const potAwarded = state.pot;
-          broadcast(tableId, { type: 'handEnded', payload: { winner,  potAwarded} });
-
-          return { success: true, winner, potAwarded: state.pot };
+          const winnerId = state.players[0];
+          const totalPot = state.pot + Object.values(state.bets).reduce((sum, bet) => sum + (bet || 0), 0);
+          state.stacks[winnerId] += totalPot;
+          const winnersSummary = [{ playerId: winnerId, amount: totalPot }];
+          await prisma.gameState.delete({ where: { tableId } });
+          broadcast(tableId, { type: 'handEnded', payload: { winners: winnersSummary } });
+          return reply.send({ success: true, winners: winnersSummary });
         }
         break;
       case 'check':
-        if (state.currentBet !== state.toCall[playerId]) {
-          return reply
-            .status(400)
-            .send({ success: false, error: 'Cannot check, must call or raise' });
+        if (state.currentBet > (state.bets[playerId] || 0)) {
+          return reply.status(400).send({ success: false, error: 'Cannot check, must call or raise' });
         }
-        state.actionLog[playerId].push('check');
+        state.actionLog[playerId].push({ action: 'check' });
         break;
       case 'call': {
-        const amountToCall = state.toCall[playerId];
+        const amountToCall = state.currentBet - (state.bets[playerId] || 0);
         if (amountToCall > state.stacks[playerId]) {
-          return reply
-            .status(400)
-            .send({ success: false, error: 'Insufficient funds to call' });
+            return reply.status(400).send({ success: false, error: 'Insufficient funds to call' });
         }
         state.stacks[playerId] -= amountToCall;
-        state.pot += amountToCall;
-        state.bets[playerId] += amountToCall; // <-- ADD THIS LINE
-        state.actionLog[playerId].push('call'); // Simplified action log
+        state.bets[playerId] = (state.bets[playerId] || 0) + amountToCall;
+        state.actionLog[playerId].push({ action: 'call' });
         break;
       }
       case 'raise': {
         if (amount == null || amount <= state.currentBet) {
-          return reply
-            .status(400)
-            .send({ success: false, error: 'Raise must exceed current bet' });
+          return reply.status(400).send({ success: false, error: 'Raise must exceed current bet' });
         }
-        
-        const totalBetAmount = amount;
-        const amountToCall = state.toCall[playerId];
-        const totalCost = totalBetAmount - state.bets[playerId];
-
-        if (totalCost > state.stacks[playerId]) {
-          return reply
-            .status(400)
-            .send({ success: false, error: 'Insufficient chips to raise' });
+        const cost = amount - (state.bets[playerId] || 0);
+        if (cost > state.stacks[playerId]) {
+          return reply.status(400).send({ success: false, error: 'Insufficient funds to raise' });
         }
-        
-        state.stacks[playerId] -= totalCost;
-        state.pot += totalCost;
-        state.bets[playerId] = totalBetAmount; // <-- SET THE TOTAL BET
-        state.currentBet = totalBetAmount;
-
-        // Update what other players need to call
-        for (const pid of state.players) {
-          if (pid !== playerId) {
-            state.toCall[pid] = state.currentBet - state.bets[pid];
-          }
-        }
-        state.toCall[playerId] = 0;
-        
-        state.actionLog[playerId].push(`raise ${amount}`);
+        state.stacks[playerId] -= cost;
+        state.currentBet = amount;
+        state.bets[playerId] = amount;
+        state.actionLog[playerId].push({ action: 'raise', amount });
         break;
       }
     }
 
-    // Advance turn
-    state.currentIndex =
-      (state.currentIndex + 1) % state.players.length;
-
-        // If back to first player, deal next street
-    if (state.currentIndex === 0) {
-      const c = state.community.length;
-      state.deck.shift(); // burn
-      if (c === 0) {
-        state.community.push(...state.deck.splice(0, 3)); // flop
-      } else if (c === 3) {
-        state.community.push(state.deck.shift()!); // turn
-      } else if (c === 4) {
-        state.community.push(state.deck.shift()!); // river
+    if (action === 'fold') {
+      if (state.players.length > 0) {
+        state.currentIndex = state.currentIndex % state.players.length;
       }
-      state.currentBet = 0;
-      for (const pid of state.players) {
-        state.toCall[pid] = 0;
-        state.bets[pid] = 0; // Reset bets for the new round
+    } else {
+      if (state.players.length > 0) {
+        state.currentIndex = (state.currentIndex + 1) % state.players.length;
       }
-      // else: showdown (to implement)
     }
 
-    const isRiverComplete = state.community.length === 5;
-        if ((isRiverComplete && state.currentIndex === 0) || state.players.length === 1) {
-      const potResults = calculatePots(state);
-      
-      const winnersSummary = [];
-      const allWinners = new Set<string>();
+    // --- START OF FIX ---
+    // This new logic correctly determines if the betting round has concluded.
+    let isBettingRoundOver = false;
+    const betsAreEqual = state.players.every(p => (state.bets[p] || 0) === state.currentBet);
 
-      // Distribute winnings
-      for (const pot of potResults) {
-        const potShare = pot.pot / pot.winners.length;
-        for (const winnerId of pot.winners) {
-          state.stacks[winnerId] += potShare;
-          allWinners.add(winnerId);
-          winnersSummary.push({playerId: winnerId, amount: potShare});
+    if (betsAreEqual) {
+        // If there was a bet/raise and everyone has called, the round is over.
+        if (state.currentBet > 0) {
+            isBettingRoundOver = true;
+        } 
+        // If the round was just checks, it's only over when the action gets back to the start.
+        else if (state.currentBet === 0 && state.currentIndex === 0) {
+            isBettingRoundOver = true;
         }
-      }
-      
-      const winnerIds = Array.from(allWinners);
+    }
+    // --- END OF FIX ---
 
-      // Persist results
-      await prisma.handHistory.updateMany({
-        where: { tableId, playerId: { in: winnerIds } },
-        data: { result: 'win' },
-      });
-      await prisma.handHistory.updateMany({
-        where: { tableId, NOT: { playerId: { in: winnerIds } } },
-        data: { result: 'lose' },
-      });
-      
-      // End of game cleanup
-      await prisma.gameState.delete({ where: { tableId }});
-      
-      // Broadcast the results
-      const payload = { winners: winnersSummary };
-      broadcast(tableId, { type: 'handEnded', payload });
-      
-      return { success: true, gameState: { ...state, players: [] }, winners: payload.winners };
+    if (isBettingRoundOver) {
+        if (state.community.length < 5) {
+            state.deck.shift(); // burn card
+            const toDeal = state.community.length === 0 ? 3 : 1;
+            state.community.push(...state.deck.splice(0, toDeal));
+            state.currentBet = 0;
+            state.bets = Object.fromEntries(state.players.map(p => [p, 0]));
+            state.currentIndex = 0;
+            await prisma.gameState.update({ where: { tableId }, data: { state: state as any } });
+            const response: Types.GameStateResponse = {
+              tableId, holeCards: state.holeCards, community: state.community,
+              deckRemaining: state.deck.length, pot: state.pot, stacks: state.stacks,
+              toAct: state.players[state.currentIndex], actionLog: state.actionLog,
+            };
+            broadcast(tableId, { type: 'gameState', payload: response });
+            return reply.send({ success: true, gameState: response });
+        }
     }
 
+    const handIsOverAfterShowdown = state.community.length === 5 && isBettingRoundOver;
 
-    // Build updated GameStateResponse
-    const gameState: Types.GameStateResponse = {
-      tableId,
-      holeCards: state.holeCards,
-      community: state.community,
-      deckRemaining: state.deck.length,
-      pot: state.pot,
-      stacks: state.stacks,
-      toAct: state.players[state.currentIndex],
-      actionLog: state.actionLog,
+    if (handIsOverAfterShowdown) {
+      for(const pid of Object.keys(state.bets)) {
+          state.pot += state.bets[pid] || 0;
+          state.bets[pid] = 0;
+      }
+      const potResults = calculatePots(state);
+      const winnersSummary: { playerId: string; amount: number }[] = [];
+      for (const pot of potResults) {
+        const share = pot.winners.length > 0 ? pot.pot / pot.winners.length : 0;
+        pot.winners.forEach(winnerId => {
+            state.stacks[winnerId] += share;
+            const existingWinner = winnersSummary.find(w => w.playerId === winnerId);
+            if(existingWinner) {
+              existingWinner.amount += share;
+            } else {
+              winnersSummary.push({playerId: winnerId, amount: share});
+            }
+        });
+      }
+      await prisma.gameState.delete({ where: { tableId } });
+      broadcast(tableId, { type: 'handEnded', payload: { winners: winnersSummary } });
+      return reply.send({ success: true, winners: winnersSummary });
+    }
+
+    await prisma.gameState.update({ where: { tableId }, data: { state: state as any } });
+    const response: Types.GameStateResponse = {
+      tableId, holeCards: state.holeCards, community: state.community,
+      deckRemaining: state.deck.length, pot: state.pot, stacks: state.stacks,
+      toAct: state.players[state.currentIndex], actionLog: state.actionLog,
     };
-    broadcast(tableId, { type: 'gameState', payload: gameState });
-    await prisma.gameState.update({
-      where: { tableId },
-      data: { state: state as any },
-    });
-    return { success: true, gameState };
+    broadcast(tableId, { type: 'gameState', payload: response });
+    return reply.send({ success: true, gameState: response });
   }
 );
 
-//
-// Start the server
-//
 async function start() {
   try {
     await app.listen({ port: 4000, host: '0.0.0.0' });

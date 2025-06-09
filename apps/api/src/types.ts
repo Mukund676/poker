@@ -1,20 +1,16 @@
-export interface StartGameRequest {
-  tableName: string;
-  playerIds: string[];    // IDs of seated players, length ≤ 8
-}
+export type Action = 'fold' | 'check' | 'call' | 'raise';
+
+export type ActionPayload =
+  | { action: 'fold' }
+  | { action: 'check' }
+  | { action: 'call' }
+  | { action: 'raise'; amount: number };
 
 export interface CardMap {
-  [playerId: string]: number[]; // hole cards per player
+  [playerId: string]: number[];
 }
 
-export interface StartGameResponse {
-  tableId: string;
-  holeCards: CardMap;
-  community: number[];    // []
-  deckRemaining: number;  // e.g. 42
-}
-
-interface InMemoryState {
+export interface InMemoryState {
   holeCards: Record<string, number[]>;
   community: number[];
   deck: number[];
@@ -22,27 +18,47 @@ interface InMemoryState {
   currentIndex: number;
   stacks: Record<string, number>;
   pot: number;
-  actionLog: Record<string, Action[]>;
+  actionLog: Record<string, ActionPayload[]>;
   currentBet: number;
-  toCall: Record<string, number>; // playerId to amount to call
+  bets: Record<string, number>;
+  toCall: Record<string, number>;
 }
 
+export interface StartGameRequest {
+  tableName: string;
+  playerIds: string[];
+}
+
+export interface StartGameResponse {
+  tableId: string;
+  holeCards: CardMap;
+  community: number[];
+  deckRemaining: number;
+}
+
+export interface BetRequest {
+  tableId: string;
+  playerId: string;
+  action: Action;
+  amount?: number;
+}
 
 export interface GameStateResponse {
   tableId: string;
   holeCards: CardMap;
   community: number[];
   deckRemaining: number;
-  pot: number;          // current pot size
-  stacks: Record<string, number>; // playerId to stack size
-  toAct: string; // playerId of the next player to act
-  actionLog: Record<string, Action[]>; // playerId to list of actions taken
+  pot: number;
+  stacks: Record<string, number>;
+  toAct: string;
+  actionLog: Record<string, ActionPayload[]>;
 }
 
-export type Action = 'fold' | 'check' | 'call' | 'raise';
-
-export interface BetRequest {
-  success: boolean; // true if the bet was successful
-  gameState: GameStateResponse;
-  error?: string; // error message if the bet was not successful
+export interface BetResponse {
+  success: boolean;
+  gameState?: GameStateResponse;
+  error?: string;
+  winner?: string;
+  potAwarded?: number;
+  winners?: { playerId: string; amount: number }[];
 }
