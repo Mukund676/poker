@@ -41,3 +41,20 @@ ALTER TABLE "HandHistory" ADD CONSTRAINT "HandHistory_tableId_fkey" FOREIGN KEY 
 
 -- AddForeignKey
 ALTER TABLE "HandHistory" ADD CONSTRAINT "HandHistory_playerId_fkey" FOREIGN KEY ("playerId") REFERENCES "Player"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- CreateTable
+CREATE TABLE "GameState" (
+    "id" TEXT NOT NULL,
+    "tableId" TEXT NOT NULL,
+    "state" JSONB NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "GameState_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "GameState_tableId_key" ON "GameState"("tableId");
+
+-- AddForeignKey
+ALTER TABLE "GameState" ADD CONSTRAINT "GameState_tableId_fkey" FOREIGN KEY ("tableId") REFERENCES "Table"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

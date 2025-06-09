@@ -1,10 +1,17 @@
 // packages/poker-engine/index.ts
 import seedrandom from 'seedrandom';
+import { Hand } from 'pokersolver';
 
 export type Card = number;
-
+const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+const suits = ['h', 'd', 'c', 's'];
 export function newDeck(): Card[] {
   return Array.from({ length: 52 }, (_, i) => i);
+}
+export function cardToString(card: Card): string {
+  const rank = ranks[card % 13];
+  const suit = suits[card / 13 | 0];
+  return rank + suit;
 }
 
 export function shuffle(deck: Card[], seed?: string): Card[] {
@@ -30,6 +37,8 @@ export function deal(deck: Card[]) {
   return { hole, flop, turn, river, remainder: d };
 }
 
-export function evaluateHand(hole: Card[], community: Card[]): string {
-  return 'TBD';
+export function evaluateHand(hole: Card[], community: Card[]): any {
+  const allCards = [...hole, ...community].map(cardToString);
+  return Hand.solve(allCards);
 }
+
