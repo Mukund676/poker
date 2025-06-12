@@ -7,22 +7,27 @@ import { Table } from '@/components/Table';
 import { Seats } from '@/components/Seats';
 import { Controls } from '@/components/Controls';
 
-// --- 1. Update the state shape to match the server's payload ---
+// --- Updated state shapes to match the new server payload ---
 interface Winner {
   playerId: string;
   amount: number;
 }
 
+interface HandInfo {
+    playerId: string;
+    descr: string;
+}
+
 export default function TablePage() {
   const { id: tableId } = useParams()!;
   const search = useSearchParams()!;
-  const router = useRouter(); // For the "Play Again" button
+  const router = useRouter();
   const playerId = search.get('playerId')!;
   const messages = useWebSocket(tableId as string);
 
   const [state, setState] = useState<any | null>(null);
-  // --- 2. Update the 'ended' state to hold an array of winners ---
-  const [ended, setEnded] = useState<{ winners: Winner[] } | null>(null);
+  // --- The 'ended' state now holds both winners and hand info ---
+  const [ended, setEnded] = useState<{ winners: Winner[]; hands: HandInfo[] } | null>(null);
 
   useEffect(() => {
     messages.forEach((msg) => {
@@ -42,10 +47,8 @@ export default function TablePage() {
     );
   }
 
-  // --- 3. Implement the new, clearer rendering logic for the end of the hand ---
+  // --- Updated rendering logic for the end-of-hand screen ---
   if (ended) {
-    const youAreAWinner = ended.winners.some(w => w.playerId === playerId);
-
     return (
       <div className="flex flex-col items-center justify-center min-h-screen p-8 text-center text-white">
         <div className="space-y-4">
@@ -54,15 +57,20 @@ export default function TablePage() {
               {winner.playerId === playerId ? 'You win' : `Player ${winner.playerId.substring(0, 4)} wins`} ${winner.amount} chips!
             </h2>
           ))}
+           {ended.winners.length === 0 && (
+             <p className="text-4xl font-bold text-gray-400">It's a tie! The pot is split.</p>
+          )}
         </div>
 
-        {!youAreAWinner && ended.winners.length > 0 && (
-          <p className="mt-4 text-2xl text-red-500">You lost.</p>
-        )}
-        
-        {ended.winners.length === 0 && (
-           <p className="mt-4 text-2xl text-gray-400">It's a tie! The pot is split.</p>
-        )}
+        {/* --- NEW: Display the hand evaluation for each player --- */}
+        <div className="mt-8 p-4 bg-gray-800/50 rounded-lg space-y-2 text-lg">
+            <h3 className="text-xl font-bold border-b border-gray-600 pb-2 mb-2">Showdown</h3>
+            {ended.hands.map((hand, index) => (
+                <p key={index} className="font-mono">
+                    <span className="font-semibold">{hand.playerId === playerId ? 'You' : `Player ${hand.playerId.substring(0, 4)}`}:</span> {hand.descr}
+                </p>
+            ))}
+        </div>
 
         <button
           onClick={() => router.push('/')}
