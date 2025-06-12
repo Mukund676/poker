@@ -16,6 +16,7 @@ export interface InMemoryState {
   deck: number[];
   players: string[];
   currentIndex: number;
+  aiPlayers: string[]; // Add this line
   stacks: Record<string, number>;
   pot: number;
   actionLog: Record<string, ActionPayload[]>;
