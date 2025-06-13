@@ -6,6 +6,7 @@ import type * as Types from './types';
 import { Hand } from 'pokersolver';
 import cors from '@fastify/cors';
 import { getAiAction } from './ai';
+import { URLSearchParams } from 'url';
 
 const prisma = new PrismaClient();
 const app = fastify({ logger: true });
@@ -13,7 +14,9 @@ const app = fastify({ logger: true });
 app.register(cors, { origin: '*' });
 app.register(websocket);
 
-const connections = new Map<string, Set<any>>();
+// --- 1. The connections map is now more powerful ---
+// It maps a tableId to another map, which maps a playerId to their WebSocket connection.
+const connections = new Map<string, Map<string, any>>();
 
 app.register(async function (fastify) {
   
@@ -81,14 +84,52 @@ app.register(async function (fastify) {
     });
   }
   
-  function broadcast(tableId: string, msg: any) {
-    const clients = connections.get(tableId);
-    if (!clients) return;
-    const data = JSON.stringify(msg);
-    for (const client of clients) {
-      if (client.readyState === 1) {
-        client.send(data);
+  // --- 2. New function to send personalized game states ---
+  async function sendPersonalizedStates(tableId: string) {
+      const gameStateRecord = await prisma.gameState.findUnique({ where: { tableId } });
+      if (!gameStateRecord) return; // Game has ended
+
+      const state: Types.InMemoryState = gameStateRecord.state as any;
+      const tableConnections = connections.get(tableId);
+      if (!tableConnections) return;
+
+      const displayedPot = state.pot + Object.values(state.bets).reduce((sum, bet) => sum + (bet || 0), 0);
+
+      // Loop through every player connected to this table
+      for (const [playerId, socket] of tableConnections.entries()) {
+          if (socket.readyState === 1) {
+              // Create a version of the hole cards specific to this player
+              const personalizedHoleCards = Object.fromEntries(
+                  Object.entries(state.holeCards).map(([pid, cards]) => {
+                      // If the player ID matches, show the cards. Otherwise, send an empty array.
+                      return [pid, pid === playerId ? cards : []];
+                  })
+              );
+
+              const response: Types.GameStateResponse = {
+                  tableId,
+                  holeCards: personalizedHoleCards, // Send the personalized card data
+                  community: state.community,
+                  deckRemaining: state.deck.length,
+                  pot: displayedPot,
+                  stacks: state.stacks,
+                  toAct: state.players[state.currentIndex],
+                  actionLog: state.actionLog,
+              };
+              socket.send(JSON.stringify({ type: 'gameState', payload: response }));
+          }
       }
+  }
+
+  // A simple broadcast for non-gamestate messages like hand-end
+  function broadcast(tableId: string, msg: any) {
+    const tableConns = connections.get(tableId);
+    if (!tableConns) return;
+    const data = JSON.stringify(msg);
+    for (const socket of tableConns.values()) {
+        if (socket.readyState === 1) {
+            socket.send(data);
+        }
     }
   }
 
@@ -211,17 +252,8 @@ app.register(async function (fastify) {
     
     await prisma.gameState.update({ where: { tableId }, data: { state: state as any } });
     
-    // --- THE FIX: Calculate the total pot for display ---
-    const displayedPot = state.pot + Object.values(state.bets).reduce((sum, bet) => sum + (bet || 0), 0);
-    
-    const response: Types.GameStateResponse = {
-        tableId, holeCards: state.holeCards, community: state.community,
-        deckRemaining: state.deck.length, 
-        pot: displayedPot, // Use the correct total pot
-        stacks: state.stacks,
-        toAct: state.players[state.currentIndex], actionLog: state.actionLog,
-    };
-    broadcast(tableId, { type: 'gameState', payload: response });
+    // --- 3. Use the new personalized function ---
+    await sendPersonalizedStates(tableId);
     await processAiTurn(tableId);
   }
 
@@ -248,26 +280,30 @@ app.register(async function (fastify) {
     }
   }
 
+  // --- 4. Update the WebSocket connection handler ---
   fastify.get('/ws/:tableId', { websocket: true }, (connection, req) => {
     const { tableId } = req.params as { tableId: string };
-    if (!tableId) return;
-    const clients = connections.get(tableId);
-    if (!clients) return connection.close(1011, 'Game not found');
-    clients.add(connection);
-    prisma.gameState.findUnique({ where: { tableId } }).then(gameStateRecord => {
-      if (connection.readyState === 1 && gameStateRecord) {
-        const state: Types.InMemoryState = gameStateRecord.state as any;
-        const displayedPot = state.pot + Object.values(state.bets).reduce((sum, bet) => sum + (bet || 0), 0);
-        const response: Types.GameStateResponse = {
-          tableId, holeCards: state.holeCards, community: state.community,
-          deckRemaining: state.deck.length, pot: displayedPot, stacks: state.stacks,
-          toAct: state.players[state.currentIndex], actionLog: state.actionLog,
-        };
-        connection.send(JSON.stringify({ type: 'gameState', payload: response }));
-      }
-    });
+    
+    // Parse playerId from the query string
+    const queryParams = new URLSearchParams(req.url.split('?')[1] || '');
+    const playerId = queryParams.get('playerId');
+
+    if (!tableId || !playerId) {
+        return connection.close(1011, 'Missing tableId or playerId');
+    }
+
+    // Store the connection by playerId
+    const tableConnections = connections.get(tableId);
+    if (!tableConnections) {
+        return connection.close(1011, 'Game not found');
+    }
+    tableConnections.set(playerId, connection);
+    
+    // When a player connects, send them their personalized state
+    sendPersonalizedStates(tableId);
+
     connection.on('close', () => {
-      clients.delete(connection);
+        tableConnections.delete(playerId);
     });
   });
   
@@ -277,7 +313,10 @@ app.register(async function (fastify) {
       const playerIds = players.map(p => p.id);
       const aiPlayerIds = players.filter(p => p.type === 'ai').map(p => p.id);
       const table = await prisma.table.create({ data: { name: tableName, seats: playerIds.length } });
-      connections.set(table.id, new Set());
+      
+      // Initialize the connections map for this table
+      connections.set(table.id, new Map());
+
       let deck = shuffle(newDeck(), Date.now().toString());
       const holeMap: Record<string, number[]> = {};
       for (const pid of playerIds) {
@@ -300,12 +339,9 @@ app.register(async function (fastify) {
         actionLog: Object.fromEntries(playerIds.map(pid => [pid, []])),
       };
       await prisma.gameState.create({ data: { tableId: table.id, state: initialState as any } });
-      const response: Types.GameStateResponse = {
-        tableId: table.id, holeCards: initialState.holeCards, community: initialState.community,
-        deckRemaining: initialState.deck.length, pot: initialState.pot, stacks: initialState.stacks,
-        toAct: initialState.players[initialState.currentIndex], actionLog: initialState.actionLog
-      };
-      broadcast(table.id, { type: 'gameState', payload: response });
+      
+      // We don't broadcast on start anymore, because the client will request it via WebSocket
+      // We can, however, trigger the first AI turn if the AI is first to act.
       await processAiTurn(table.id);
       reply.send({ tableId: table.id });
     } catch (error: any) {
@@ -333,7 +369,11 @@ app.register(async function (fastify) {
       const state: Types.InMemoryState = gameStateRecord.state as any;
       const displayedPot = state.pot + Object.values(state.bets).reduce((sum, bet) => sum + (bet || 0), 0);
       const response: Types.GameStateResponse = {
-        tableId, holeCards: state.holeCards, community: state.community,
+        tableId, 
+        // We can't send personalized cards here, so we send none.
+        // The real state comes via WebSocket.
+        holeCards: {}, 
+        community: state.community,
         deckRemaining: state.deck.length, pot: displayedPot, stacks: state.stacks,
         toAct: state.players[state.currentIndex], actionLog: state.actionLog,
       };
