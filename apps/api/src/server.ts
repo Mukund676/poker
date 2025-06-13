@@ -5,6 +5,7 @@ import { newDeck, shuffle } from '@poker/engine';
 import type * as Types from './types';
 import { Hand } from 'pokersolver';
 import cors from '@fastify/cors';
+import { getAiAction } from './ai';
 
 const prisma = new PrismaClient();
 const app = fastify({ logger: true });
@@ -16,7 +17,6 @@ const connections = new Map<string, Set<any>>();
 
 app.register(async function (fastify) {
   
-  // --- Helper Functions ---
   const SUITS = ['h', 's', 'c', 'd'];
   const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
 
@@ -56,7 +56,7 @@ app.register(async function (fastify) {
       pots.push({ amount: mainPotAmount, players: [...state.players] });
     }
 
-    const potResults = pots.map(pot => {
+    return pots.map(pot => {
       const communityCardsStr = state.community.map(cardIdToString);
       const eligibleHands = pot.players.map(pid => {
         const holeCardsStr = state.holeCards[pid].map(cardIdToString);
@@ -64,15 +64,21 @@ app.register(async function (fastify) {
         const solvedHand = Hand.solve(allCards);
         return { pid: pid, solvedHand: solvedHand };
       });
+
       if (eligibleHands.length === 0) {
         return { pot: pot.amount, players: pot.players, winners: [] };
       }
-      const winningPokerHands = Hand.winners(eligibleHands.map(h => h.solvedHand));
-      const winningDescr = winningPokerHands[0].descr;
-      const winners = eligibleHands.filter(h => h.solvedHand.descr === winningDescr).map(h => h.pid);
-      return { pot: pot.amount, players: pot.players, winners: [...new Set(winners)] };
+      
+      const allPlayerSolvedHands = eligibleHands.map(h => h.solvedHand);
+      const winningSolvedHands = Hand.winners(allPlayerSolvedHands);
+      const winningHandStrings = new Set(winningSolvedHands.map(h => h.toString()));
+      
+      const winnerPids = eligibleHands
+        .filter(h => winningHandStrings.has(h.solvedHand.toString()))
+        .map(h => h.pid);
+
+      return { pot: pot.amount, players: pot.players, winners: [...new Set(winnerPids)] };
     });
-    return potResults;
   }
   
   function broadcast(tableId: string, msg: any) {
@@ -86,7 +92,6 @@ app.register(async function (fastify) {
     }
   }
 
-  // --- NEW: Central function to apply actions and advance the game ---
   async function applyAction(tableId: string, playerId: string, action: string, amount?: number) {
     const gameStateRecord = await prisma.gameState.findUnique({ where: { tableId } });
     if (!gameStateRecord) throw new Error('Game not found');
@@ -107,7 +112,7 @@ app.register(async function (fastify) {
           const winnersSummary = [{ playerId: winnerId, amount: totalPot }];
           await prisma.gameState.delete({ where: { tableId } });
           broadcast(tableId, { type: 'handEnded', payload: { winners: winnersSummary } });
-          return; // End of hand
+          return;
         }
         break;
       case 'check':
@@ -140,18 +145,14 @@ app.register(async function (fastify) {
       }
     }
 
-    // Advance turn
     if (action === 'fold') {
         if (state.players.length > 0) state.currentIndex = state.currentIndex % state.players.length;
     } else {
         if (state.players.length > 0) state.currentIndex = (state.currentIndex + 1) % state.players.length;
     }
 
-    // Check for end of betting round
     let isBettingRoundOver = false;
     const activePlayers = state.players.filter(p => state.holeCards[p]);
-    // Round is over if all active players have bet the same amount, and the amount is not zero
-    // or if all players have checked (bet is zero)
     const betsAreEqual = activePlayers.every(p => (state.bets[p] || 0) === state.currentBet);
     const allActivePlayersHaveActed = activePlayers.every(p => state.actionLog[p] && state.actionLog[p].length > 0);
 
@@ -160,17 +161,13 @@ app.register(async function (fastify) {
     }
 
     if (isBettingRoundOver) {
-        // Collect bets into the pot
         state.pot += Object.values(state.bets).reduce((sum, bet) => sum + bet, 0);
-        // Reset bets for next round
         state.bets = Object.fromEntries(state.players.map(p => [p, 0]));
         state.currentBet = 0;
         state.currentIndex = 0;
         state.actionLog = Object.fromEntries(state.players.map(p => [p, []]));
-
-        // Deal next community cards if not at the river
         if (state.community.length < 5) {
-            state.deck.shift(); // Burn card
+            state.deck.shift();
             const toDeal = state.community.length === 0 ? 3 : 1;
             for(let i=0; i<toDeal; ++i) state.community.push(state.deck.shift()!);
         }
@@ -193,51 +190,64 @@ app.register(async function (fastify) {
           }
         });
       }
+      
+      const communityCardsStr = state.community.map(cardIdToString);
+      const hands = state.players.map(pid => {
+         const holeCardsStr = state.holeCards[pid]?.map(cardIdToString) || [];
+         const allCards = holeCardsStr.concat(communityCardsStr);
+         const solvedHand = Hand.solve(allCards);
+         return { 
+             playerId: pid, 
+             descr: solvedHand.descr,
+             holeCards: state.holeCards[pid]
+         };
+      });
+
       await prisma.gameState.delete({ where: { tableId } });
-      broadcast(tableId, { type: 'handEnded', payload: { winners: winnersSummary } });
-      return; // End of hand
+      
+      broadcast(tableId, { type: 'handEnded', payload: { winners: winnersSummary, hands: hands } });
+      return;
     }
     
     await prisma.gameState.update({ where: { tableId }, data: { state: state as any } });
+    
+    // --- THE FIX: Calculate the total pot for display ---
+    const displayedPot = state.pot + Object.values(state.bets).reduce((sum, bet) => sum + (bet || 0), 0);
+    
     const response: Types.GameStateResponse = {
         tableId, holeCards: state.holeCards, community: state.community,
-        deckRemaining: state.deck.length, pot: state.pot, stacks: state.stacks,
+        deckRemaining: state.deck.length, 
+        pot: displayedPot, // Use the correct total pot
+        stacks: state.stacks,
         toAct: state.players[state.currentIndex], actionLog: state.actionLog,
     };
     broadcast(tableId, { type: 'gameState', payload: response });
-
     await processAiTurn(tableId);
   }
 
-  // --- NEW: Function to process AI turns ---
   async function processAiTurn(tableId: string) {
     const gameStateRecord = await prisma.gameState.findUnique({ where: { tableId } });
-    if (!gameStateRecord) return; // Game ended
-
+    if (!gameStateRecord) return;
     const state: Types.InMemoryState = gameStateRecord.state as any;
-    if (state.players.length === 0) return; // No players left
-    
+    if (state.players.length === 0) return;
     const playerToAct = state.players[state.currentIndex];
-
     if (state.aiPlayers.includes(playerToAct)) {
-      // Simple AI: Always call if possible, otherwise check.
       setTimeout(async () => {
+        const { action, amount } = getAiAction(state, playerToAct);
         const amountToCall = state.currentBet - (state.bets[playerToAct] || 0);
-        if (amountToCall > 0) {
+        if (action === 'check' && amountToCall > 0) {
             if(state.stacks[playerToAct] >= amountToCall) {
-                await applyAction(tableId, playerToAct, 'call');
+               await applyAction(tableId, playerToAct, 'call');
             } else {
-                // Not enough to call, must go all-in or fold, let's just call all-in
-                await applyAction(tableId, playerToAct, 'call');
+               await applyAction(tableId, playerToAct, 'fold');
             }
         } else {
-            await applyAction(tableId, playerToAct, 'check');
+            await applyAction(tableId, playerToAct, action, amount);
         }
-      }, 1000); // 1-second delay for AI action
+      }, 1000);
     }
   }
 
-  // WebSocket route
   fastify.get('/ws/:tableId', { websocket: true }, (connection, req) => {
     const { tableId } = req.params as { tableId: string };
     if (!tableId) return;
@@ -247,9 +257,10 @@ app.register(async function (fastify) {
     prisma.gameState.findUnique({ where: { tableId } }).then(gameStateRecord => {
       if (connection.readyState === 1 && gameStateRecord) {
         const state: Types.InMemoryState = gameStateRecord.state as any;
+        const displayedPot = state.pot + Object.values(state.bets).reduce((sum, bet) => sum + (bet || 0), 0);
         const response: Types.GameStateResponse = {
           tableId, holeCards: state.holeCards, community: state.community,
-          deckRemaining: state.deck.length, pot: state.pot, stacks: state.stacks,
+          deckRemaining: state.deck.length, pot: displayedPot, stacks: state.stacks,
           toAct: state.players[state.currentIndex], actionLog: state.actionLog,
         };
         connection.send(JSON.stringify({ type: 'gameState', payload: response }));
@@ -260,7 +271,6 @@ app.register(async function (fastify) {
     });
   });
   
-  // HTTP routes
   fastify.post('/start-game', async (req, reply) => {
     try {
       const { tableName, players } = req.body as { tableName: string, players: {id: string, type: 'human' | 'ai'}[]};
@@ -281,7 +291,7 @@ app.register(async function (fastify) {
       }
       const initialState: Types.InMemoryState = {
         holeCards: holeMap, community: [], deck, players: playerIds, 
-        aiPlayers: aiPlayerIds, // Store AI players
+        aiPlayers: aiPlayerIds,
         currentIndex: 0,
         stacks: Object.fromEntries(playerIds.map(pid => [pid, 1000])),
         pot: 0, currentBet: 0,
@@ -290,16 +300,10 @@ app.register(async function (fastify) {
         actionLog: Object.fromEntries(playerIds.map(pid => [pid, []])),
       };
       await prisma.gameState.create({ data: { tableId: table.id, state: initialState as any } });
-      
       const response: Types.GameStateResponse = {
-        tableId: table.id,
-        holeCards: initialState.holeCards,
-        community: initialState.community,
-        deckRemaining: initialState.deck.length,
-        pot: initialState.pot,
-        stacks: initialState.stacks,
-        toAct: initialState.players[initialState.currentIndex],
-        actionLog: initialState.actionLog
+        tableId: table.id, holeCards: initialState.holeCards, community: initialState.community,
+        deckRemaining: initialState.deck.length, pot: initialState.pot, stacks: initialState.stacks,
+        toAct: initialState.players[initialState.currentIndex], actionLog: initialState.actionLog
       };
       broadcast(table.id, { type: 'gameState', payload: response });
       await processAiTurn(table.id);
@@ -327,16 +331,16 @@ app.register(async function (fastify) {
       const gameStateRecord = await prisma.gameState.findUnique({ where: { tableId } });
       if (!gameStateRecord) return reply.status(404).send({ error: 'Game not found' });
       const state: Types.InMemoryState = gameStateRecord.state as any;
+      const displayedPot = state.pot + Object.values(state.bets).reduce((sum, bet) => sum + (bet || 0), 0);
       const response: Types.GameStateResponse = {
         tableId, holeCards: state.holeCards, community: state.community,
-        deckRemaining: state.deck.length, pot: state.pot, stacks: state.stacks,
+        deckRemaining: state.deck.length, pot: displayedPot, stacks: state.stacks,
         toAct: state.players[state.currentIndex], actionLog: state.actionLog,
       };
       return reply.send(response);
     });
 });
 
-// Start the server
 async function start() {
   try {
     await app.listen({ port: 4000, host: '0.0.0.0' });
