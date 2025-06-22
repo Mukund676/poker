@@ -11,7 +11,7 @@ export function Seats({ holeCards, stacks, toAct, you }: SeatsProps) {
   const playerIds = Object.keys(stacks);
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+    <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
       {playerIds.map((playerId) => (
         <div
           key={playerId}

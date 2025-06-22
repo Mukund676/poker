@@ -1,117 +1,132 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useSearchParams, useParams, useRouter } from 'next/navigation';
-import { useWebSocket } from '@/lib/useWebSocket';
-import { Table } from '@/components/Table';
-import { Seats } from '@/components/Seats';
-import { Controls } from '@/components/Controls';
-import { Card } from '@poker/ui/card';
+import { useWebSocket } from '../../../lib/useWebSocket';
 
-interface Winner {
-  playerId: string;
-  amount: number;
+import { Table } from '../../../components/Table';
+import { Controls } from '../../../components/Controls';
+import { Seats } from '../../../components/Seats';
+
+// Define a type for the game state for better type safety
+interface GameState {
+  tableId: string;
+  holeCards: Record<string, number[]>;
+  community: number[];
+  pot: number;
+  stacks: Record<string, number>;
+  toAct: string;
+  actionLog: Record<string, any[]>;
 }
-
-interface HandInfo {
-  playerId: string;
-  descr: string;
-  holeCards: number[];
-}
-
-function ResultsModal({ ended, playerId, onPlayAgain }: { ended: any, playerId: string, onPlayAgain: () => void }) {
-  if (!ended) return null;
-
-  return (
-    <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
-      <div className="bg-gray-800 rounded-lg shadow-2xl p-6 text-center text-white w-full max-w-lg">
-        <div className="space-y-4">
-          {ended.winners.map((winner: Winner, index: number) => (
-            <h2 key={index} className={`text-3xl md:text-4xl font-bold ${winner.playerId === playerId ? 'text-green-400' : 'text-red-400'}`}>
-              {winner.playerId === playerId ? 'You win' : `Player ${winner.playerId.substring(0, 4)} wins`} ${winner.amount} chips!
-            </h2>
-          ))}
-          {ended.winners.length === 0 && (
-            <p className="text-3xl md:text-4xl font-bold text-gray-400">It's a tie! The pot is split.</p>
-          )}
-        </div>
-
-        {ended.hands && ended.hands.length > 0 && (
-          <div className="mt-6 p-4 bg-gray-900 rounded-lg space-y-3 text-base md:text-lg">
-            <h3 className="text-xl font-bold border-b border-gray-600 pb-2 mb-3">Showdown</h3>
-            {ended.hands.map((hand: HandInfo, index: number) => (
-              // --- THIS IS THE NEW, COMBINED LAYOUT ---
-              <div key={index} className="flex items-center justify-between p-2 bg-gray-700/50 rounded-md">
-                <p className="font-semibold w-1/4 text-left">
-                  {hand.playerId === playerId ? 'You' : `Player ${hand.playerId.substring(0, 4)}`}
-                </p>
-                <div className="flex items-center justify-end space-x-3 w-3/4">
-                  <p className="font-mono text-gray-300 flex-shrink-0">{hand.descr}</p>
-                  <div className="flex space-x-1">
-                    {hand.holeCards.map((cardId, i) => <Card key={i} cardId={cardId} />)}
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        <button
-          onClick={onPlayAgain}
-          className="mt-6 px-8 py-3 bg-blue-600 text-white font-bold rounded-lg shadow-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50"
-        >
-          Play Again
-        </button>
-      </div>
-    </div>
-  );
-}
-
 
 export default function TablePage() {
-  const { id: tableId } = useParams()!;
-  const search = useSearchParams()!;
+  const params = useParams();
+  const searchParams = useSearchParams();
   const router = useRouter();
-  const playerId = search.get('playerId')!;
-  const messages = useWebSocket(tableId as string);
 
-  const [state, setState] = useState<any | null>(null);
-  const [ended, setEnded] = useState<{ winners: Winner[]; hands?: HandInfo[] } | null>(null);
+  const tableId = params.id as string;
+  const playerId = searchParams.get('playerId');
 
-  useEffect(() => {
-    messages.forEach((msg) => {
-      if (msg.type === 'gameState') {
-        setState(msg.payload);
-      } else if (msg.type === 'handEnded') {
-        setEnded(msg.payload);
+  const [gameState, setGameState] = useState<GameState | null>(null);
+  const [lastMessage, setLastMessage] = useState<any>(null); // To store handEnded or gameOver messages
+
+  const onMessage = (event: MessageEvent) => {
+    const data = JSON.parse(event.data);
+    if (data.type === 'gameState') {
+      setGameState(data.payload);
+      setLastMessage(null); // Clear previous hand/game over messages
+    } else if (data.type === 'handEnded' || data.type === 'gameOver') {
+      setLastMessage(data.payload);
+      if (data.type === 'gameOver') {
+        setTimeout(() => router.push('/'), 5000); // Redirect to home after 5s
       }
-    });
-  }, [messages]);
+    }
+  };
 
-  if (!state) {
+  useWebSocket(`ws://localhost:4000/ws/${tableId}`, onMessage);
+
+  const handleLeaveGame = async () => {
+    if (!tableId || !playerId) return;
+    await fetch('http://localhost:4000/leave-game', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tableId, playerId }),
+    });
+    router.push('/');
+  };
+  
+  const handleAction = async (action: string, amount?: number) => {
+    if (!tableId || !playerId) return;
+    try {
+      await fetch('http://localhost:4000/bet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tableId, playerId, action, amount }),
+      });
+    } catch (error) {
+      console.error('Failed to perform action:', error);
+    }
+  };
+
+  if (!playerId) {
     return (
-      <div className="flex items-center justify-center min-h-screen text-white text-xl">
-        Loading...
-      </div>
+      <main className="flex min-h-screen flex-col items-center justify-center bg-gray-900 text-white p-8">
+        <p>Error: Player ID is missing.</p>
+      </main>
     );
   }
 
+  if (!gameState) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center bg-gray-900 text-white p-8">
+        <p>Loading Table...</p>
+      </main>
+    );
+  }
+  
+  const isPlayerToAct = gameState.toAct === playerId;
+
   return (
-    <div className="p-4 space-y-6">
-      <ResultsModal ended={ended} playerId={playerId} onPlayAgain={() => router.push('/')} />
-      
-      <Table community={state.community} pot={state.pot} />
-      <Seats
-        holeCards={state.holeCards}
-        stacks={state.stacks}
-        toAct={ended ? '' : state.toAct} 
-        you={playerId}
-      />
-      <Controls
-        tableId={tableId as string}
-        playerId={playerId}
-        toAct={ended ? '' : state.toAct}
-      />
-    </div>
+    <main className="flex min-h-screen flex-col items-center justify-between bg-gray-900 text-white p-4 md:p-8">
+      <div className="w-full max-w-6xl mx-auto">
+        <div className="flex justify-between items-start mb-4">
+            <h1 className="text-2xl font-bold">Table: {tableId}</h1>
+            <button 
+                onClick={handleLeaveGame}
+                className="px-4 py-2 bg-red-600 text-white font-bold rounded-lg shadow-lg hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500"
+            >
+                Leave Game
+            </button>
+        </div>
+        
+        <Seats
+          holeCards={gameState.holeCards}
+          stacks={gameState.stacks}
+          toAct={gameState.toAct}
+          you={playerId}
+        />
+      </div>
+
+      <div className="my-4 w-full max-w-2xl">
+        <Table communityCards={gameState.community} pot={gameState.pot} />
+        {lastMessage && (
+          <div className="text-center p-4 my-4 bg-yellow-900/50 rounded-lg">
+             {lastMessage.winner && <p className="text-xl font-bold text-yellow-300">Game Over! Winner: {lastMessage.winner}</p>}
+             {lastMessage.winners && <p className="text-lg font-semibold text-yellow-400">
+               Winner(s): {lastMessage.winners.map((w: any) => `${w.playerId.substring(0,4)} wins $${w.amount}`).join(', ')}
+             </p>}
+             {lastMessage.hands && lastMessage.hands.length > 0 && (
+                <div className="text-sm text-gray-300 mt-2">
+                    {lastMessage.hands.map((h: any) => <p key={h.playerId}>{h.playerId.substring(0,4)} had: {h.descr}</p>)}
+                </div>
+             )}
+          </div>
+        )}
+      </div>
+
+      <div className="w-full max-w-2xl">
+        <Controls onAction={handleAction} disabled={!isPlayerToAct} />
+      </div>
+    </main>
   );
 }

@@ -1,4 +1,5 @@
 export type Action = 'fold' | 'check' | 'call' | 'raise';
+export type Difficulty = 'easy' | 'medium' | 'hard';
 
 export type ActionPayload =
   | { action: 'fold' }
@@ -15,33 +16,31 @@ export interface InMemoryState {
   community: number[];
   deck: number[];
   players: string[];
+  initialPlayers: string[]; // To keep track of all original players
   currentIndex: number;
-  aiPlayers: string[]; // Add this line
+  dealerIndex: number; // To track the dealer button
+  aiPlayers: string[];
   stacks: Record<string, number>;
   pot: number;
   actionLog: Record<string, ActionPayload[]>;
   currentBet: number;
   bets: Record<string, number>;
   toCall: Record<string, number>;
+  difficulty: Difficulty;
 }
 
 export interface StartGameRequest {
   tableName: string;
-  playerIds: string[];
+  players: { id: string, type: 'human' | 'ai' }[];
+  difficulty: Difficulty;
 }
 
+// ... rest of the file is unchanged
 export interface StartGameResponse {
   tableId: string;
   holeCards: CardMap;
   community: number[];
   deckRemaining: number;
-}
-
-export interface BetRequest {
-  tableId: string;
-  playerId: string;
-  action: Action;
-  amount?: number;
 }
 
 export interface GameStateResponse {
@@ -53,6 +52,13 @@ export interface GameStateResponse {
   stacks: Record<string, number>;
   toAct: string;
   actionLog: Record<string, ActionPayload[]>;
+}
+
+export interface BetRequest {
+    tableId: string;
+    playerId: string;
+    action: 'fold' | 'check' | 'call' | 'raise';
+    amount?: number;
 }
 
 export interface BetResponse {

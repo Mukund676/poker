@@ -8,6 +8,7 @@ export default function HomePage() {
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [difficulty, setDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
 
   // This function will be called when the user clicks the "Create Game" button.
   const handleCreateGame = async () => {
@@ -17,7 +18,7 @@ export default function HomePage() {
     try {
       // 1. Generate unique IDs for the players.
       const humanPlayerId = uuidv4();
-      const aiPlayerId = uuidv4();
+      const aiPlayerIds = Array.from({ length: 5 }, () => uuidv4());
 
       // 2. Send the request to your API to start a new game.
       const response = await fetch('http://localhost:4000/start-game', {
@@ -25,15 +26,14 @@ export default function HomePage() {
         headers: {
           'Content-Type': 'application/json',
         },
-        // --- MODIFIED: Send player info, including types ---
-        // The API now expects a 'players' array with objects,
-        // each specifying the player's ID and their type ('human' or 'ai').
+        // --- MODIFIED: Send player info, including types and difficulty ---
         body: JSON.stringify({
           tableName: `Game-${Math.floor(Math.random() * 1000)}`,
           players: [
             { id: humanPlayerId, type: 'human' },
-            { id: aiPlayerId, type: 'ai' },
+            ...aiPlayerIds.map(id => ({ id, type: 'ai' })),
           ],
+          difficulty,
         }),
       });
 
@@ -70,6 +70,22 @@ export default function HomePage() {
       </div>
 
       <div className="w-full max-w-sm">
+        <div className="mb-4">
+          <label htmlFor="difficulty" className="block text-sm font-medium text-gray-400 mb-2">
+            AI Difficulty
+          </label>
+          <select
+            id="difficulty"
+            value={difficulty}
+            onChange={(e) => setDifficulty(e.target.value as 'easy' | 'medium' | 'hard')}
+            className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-md text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="easy">Easy</option>
+            <option value="medium">Medium</option>
+            <option value="hard">Hard</option>
+          </select>
+        </div>
+
         <button
           onClick={handleCreateGame}
           disabled={isLoading}
